@@ -6,46 +6,54 @@ import json
 import datetime
 import time
 
-def get_dcinside_posts():
-    # URL 설정
-    url = "https://gall.dcinside.com/mgallery/board/lists/?id=tenbagger&exception_mode=recommend"
+def get_dcinside_posts(start_page: int = 1, end_page: int = 10):
+    """여러 페이지의 DC인사이드 게시글을 수집하는 함수"""
+    # 결과 저장할 리스트
+    all_results = []
     
     # User-Agent 설정 (차단 방지)
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
     }
     
-    try:
-        # 웹페이지 요청
-        response = requests.get(url, headers=headers)
-        response.raise_for_status()  # 오류 발생시 예외 발생
-        
-        # BeautifulSoup으로 HTML 파싱
-        soup = BeautifulSoup(response.text, 'html.parser')
-        
-        # 게시글 목록 찾기 (수정된 선택자 사용)
-        posts = soup.select('tbody.listwrap2 td.gall_tit > a[href^="/mgallery"]')
-        
-        # 결과 저장할 리스트
-        results = []
-        
-        # 각 게시글의 제목과 링크 추출
-        for post in posts:
-            title = post.text.strip()
-            link = "https://gall.dcinside.com" + post['href']
-            results.append({"title": title, "link": link})
-        
-        return results
-        
-    except requests.RequestException as e:
-        print(f"에러 발생: {e}")
-        return []
+    for page in range(start_page, end_page + 1):
+        try:
+            # URL 설정 (페이지 번호 포함)
+            url = f"https://gall.dcinside.com/mgallery/board/lists/?id=tenbagger&exception_mode=recommend&page={page}"
+            
+            print(f"{page}페이지 수집 중...")
+            
+            # 웹페이지 요청
+            response = requests.get(url, headers=headers)
+            response.raise_for_status()
+            
+            # BeautifulSoup으로 HTML 파싱
+            soup = BeautifulSoup(response.text, 'html.parser')
+            
+            # 게시글 목록 찾기
+            posts = soup.select('tbody.listwrap2 td.gall_tit > a[href^="/mgallery"]')
+            
+            # 각 게시글의 제목과 링크 추출
+            for post in posts:
+                title = post.text.strip()
+                link = "https://gall.dcinside.com" + post['href']
+                all_results.append({"title": title, "link": link})
+            
+            # 과도한 요청 방지를 위한 지연
+            time.sleep(1)
+            
+        except requests.RequestException as e:
+            print(f"{page}페이지 수집 중 에러 발생: {e}")
+            continue
+    
+    print(f"총 {len(all_results)}개의 게시글을 수집했습니다.")
+    return all_results
 
 def chat_with_groq(message: str) -> Dict[Any, Any]:
     """
     Groq API를 사용하여 deepseek-r1-distill-llama-70b 모델과 대화하는 함수
     """
-    api_key = "~"
+    api_key = "~~"
     # api_key = os.getenv("GROQ_API_KEY")
     if not api_key:
         raise ValueError("GROQ_API_KEY 환경 변수가 설정되지 않았습니다.")
@@ -87,18 +95,7 @@ def parse_analysis_to_json(analysis_text: str) -> list:
             continue
             
         # 번호로 시작하는 라인 처리 (예: "48. Score: 6/10")
-        if line[0].isdigit() and 'Score:' in line:
-            if current_item:
-                results.append(current_item)
-            current_item = {}
-            # 번호 추출
-            number = line.split('.')[0]
-            current_item['number'] = int(number)
-            # Score 추출
-            score = line.split('Score:')[1].strip()
-            current_item['score'] = int(score.split('/')[0])
-        # 일반적인 "번:" 형식 처리
-        elif line.endswith('번:'):
+        if line.endswith('번:'):
             if current_item:
                 results.append(current_item)
             current_item = {'number': int(line[:-2])}
@@ -229,40 +226,58 @@ def get_score_color(score: int) -> int:
     else:
         return 0xff0000  # 빨간색
 
+def chunk_posts(posts: list, chunk_size: int = 50):
+    """게시글 목록을 chunk_size 단위로 나누는 함수"""
+    for i in range(0, len(posts), chunk_size):
+        yield posts[i:i + chunk_size]
+
 def main2():
     # 게시글 정보 가져오기
-    posts = get_dcinside_posts()
+    posts = get_dcinside_posts(1, 3)
     
     if not posts:
         print("게시글을 가져오는데 실패했습니다.")
         return
-        
-    # 분석 프롬프트 생성 및 API 호출
-    prompt = get_analysis_prompt(posts)
-    response = chat_with_groq(prompt)
     
-    if response and 'choices' in response:
-        analysis = response['choices'][0]['message']['content']
-        if '<think>' in analysis:
-            analysis = analysis.split('</think>')[-1].strip()
+    all_results = []
+    # 게시글을 50개씩 나누어 분석
+    for i, chunk in enumerate(chunk_posts(posts), 1):
+        print(f"\n=== 청크 {i} 분석 중 ({len(chunk)}개 게시글) ===")
+        
+        # 분석 프롬프트 생성 및 API 호출
+        prompt = get_analysis_prompt(chunk)
+        response = chat_with_groq(prompt)
+        
+        if response and 'choices' in response:
+            analysis = response['choices'][0]['message']['content']
+            if '<think>' in analysis:
+                analysis = analysis.split('</think>')[-1].strip()
+                
+            analysis_results = parse_analysis_to_json(analysis)
+            chunk_results = combine_analysis_results(chunk, analysis_results)
+            all_results.extend(chunk_results)
             
-        analysis_results = parse_analysis_to_json(analysis)
-        
-        final_results = combine_analysis_results(posts, analysis_results)
-        
+            print(f"청크 {i} 분석 완료")
+            time.sleep(5)  # API 요청 간 지연
+        else:
+            print(f"청크 {i} 분석 실패")
+    
+    if all_results:
+        # 점수(score)를 기준으로 내림차순 정렬
+        all_results = sorted(all_results, key=lambda x: x['analysis']['score'], reverse=True)
         # JSON 파일로 저장
-        filename = save_results_to_json(final_results)
+        filename = save_results_to_json(all_results)
         print(f"\n분석 결과가 {filename}에 저장되었습니다.")
         
         # Discord로 전송
-        webhook_url = "~"
-        send_to_discord(final_results, webhook_url)
+        webhook_url = "~~"
+        send_to_discord(all_results, webhook_url)
         print("분석 결과가 Discord로 전송되었습니다.")
         
         # 콘솔에 결과 출력
-        print_analysis_results(final_results)
+        print_analysis_results(all_results)
     else:
-        print("분석 실패")
+        print("모든 분석이 실패했습니다.")
 
 if __name__ == "__main__":
     # main()  # 개별 분석
